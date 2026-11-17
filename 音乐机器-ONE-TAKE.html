@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ONE TAKE · 音乐机器</title>
+<style>
+  html,body{margin:0;height:100%;background:#141210;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #frame{position:relative}
+  canvas{display:block;width:100%;height:auto;border-radius:4px;box-shadow:0 30px 100px rgba(0,0,0,.8)}
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;cursor:pointer;background:rgba(20,18,16,.85)}
+  #playBtn{width:96px;height:96px;background:#e8572a;color:#f2e8d5;font-size:36px;display:flex;align-items:center;justify-content:center;padding-left:8px;transition:transform .15s;box-shadow:8px 8px 0 #1a1712}
+  #overlay:hover #playBtn{transform:translate(-2px,-2px);box-shadow:12px 12px 0 #1a1712}
+  #hint{color:#f2e8d5;font-size:16px;letter-spacing:4px;text-align:center;line-height:2;font-family:"KaiTi","STKaiti",serif}
+  #hint small{display:block;color:#a89f8a;font-size:12px;font-family:"Cascadia Code","Consolas",monospace;letter-spacing:2px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="frame">
+    <canvas id="cv" width="1280" height="720"></canvas>
+    <div id="overlay">
+      <div id="playBtn">&#9654;</div>
+      <div id="hint">ONE TAKE · 音乐机器<small>CHOREOGRAPHED PHYSICS · 120 BPM GRID · EVERY SOUND HAS A MOVEMENT<br>点击播放 · 空格暂停 · R 重播</small></div>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+/* =====================================================================
+   ONE TAKE · 音乐机器 —— 向 adrianduta96「Motion Graphics Music Machine」
+   提示词致敬的自行发挥版。
+   核心：小球路径为「逆向编舞」——先定 120 BPM 节拍网格上的打击时刻，
+   再反推抛物线，保证每个声音都精确对应一个可见动作。
+   包豪斯海报风：米色纸面 / 墨黑 / 信号红 / 钴蓝 / 向日葵黄。
+   ===================================================================== */
+
+const W=1280,H=720;
+const BPM=120,BEAT=60/BPM,EIGHTH=BEAT/2;      // 0.5s / 0.25s
+const GROOVE_T=20;                             // 小球释放时刻（节拍0）
+const DUR=32;
+
+/* ---------------- 调色板 ---------------- */
+const PAPER='#f2e8d5', INK='#1a1712', RED='#e8572a', BLUE='#2b50c8', YEL='#f5b921', WHITE='#fdfaf2';
+const KEY_COLS=[BLUE,RED,YEL,BLUE,RED,YEL,BLUE,RED];
+
+/* ---------------- 时间线 ---------------- */
+const TYPE_T=2.0, TYPE_CPS=2.13;               // 打字
+const TXT='造一台会唱歌的机器。';
+const DING_T=7.0, FALL_T=7.3, BUILD_T=9.3;
+const BALL_IN=18.0, SUSP1=19.5, SUSP2=19.75;
+const SNAP_T=26.0;                             // 终击（节拍12）
+const FADE_T=31.0;
+
+/* ====================================================================
+   音频引擎
+   ==================================================================== */
+let AC=null,master=null,noiseBuf=null;
+function initAudio(){
+  if(AC)return;
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain();master.gain.value=0.9;
+  const comp=AC.createDynamicsCompressor();
+  comp.threshold.value=-14;comp.ratio.value=4;comp.attack.value=0.003;comp.release.value=0.2;
+  master.connect(comp);comp.connect(AC.destination);
+  noiseBuf=AC.createBuffer(1,AC.sampleRate,AC.sampleRate);
+  const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+}
+const FQ=m=>440*Math.pow(2,(m-69)/12);
+function noise(t,dur){const s=AC.createBufferSource();s.buffer=noiseBuf;s.loop=true;s.start(t);s.stop(t+dur);return s;}
+
+/* 打字机敲击 */
+function typeTick(t){
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type='square';o.frequency.value=1700+Math.random()*300;
+  g.gain.setValueAtTime(0.09,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.025);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.03);
+  const s=noise(t,0.03);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=4000;
+  const g2=AC.createGain();g2.gain.setValueAtTime(0.06,t);g2.gain.exponentialRampToValueAtTime(0.001,t+0.02);
+  s.connect(f);f.connect(g2);g2.connect(master);
+}
+/* 回车铃 */
+function ding(t){
+  [1567,2093].forEach((fq,i)=>{
+    const o=AC.createOscillator(),g=AC.createGain();
+    o.type='sine';o.frequency.value=fq;
+    g.gain.setValueAtTime(0.12/(i+1),t);g.gain.exponentialRampToValueAtTime(0.001,t+0.5);
+    o.connect(g);g.connect(master);o.start(t);o.stop(t+0.55);
+  });
+}
+/* 纸张撕裂 */
+function crack(t){
+  const s=noise(t,0.2);
+  const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=1200;f.Q.value=0.6;
+  const g=AC.createGain();g.gain.setValueAtTime(0.3,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.18);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+/* 装配咔哒 */
+function thock(t,g0){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sine';
+  o.frequency.setValueAtTime(320,t);o.frequency.exponentialRampToValueAtTime(120,t+0.06);
+  g.gain.setValueAtTime((g0||0.3),t);g.gain.exponentialRampToValueAtTime(0.001,t+0.09);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.1);
+  const s=noise(t,0.04);
+  const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=900;
+  const g2=AC.createGain();g2.gain.setValueAtTime((g0||0.3)*0.5,t);g2.gain.exponentialRampToValueAtTime(0.001,t+0.03);
+  s.connect(f);f.connect(g2);g2.connect(master);
+}
+/* 呼啸（滑梯入场） */
+function whoosh(t){
+  const s=noise(t,0.3);
+  const f=AC.createBiquadFilter();f.type='lowpass';
+  f.frequency.setValueAtTime(400,t);f.frequency.exponentialRampToValueAtTime(2400,t+0.22);
+  const g=AC.createGain();g.gain.setValueAtTime(0.14,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.28);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+/* 重件落地 */
+function thud(t,g0){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sine';
+  o.frequency.setValueAtTime(130,t);o.frequency.exponentialRampToValueAtTime(48,t+0.13);
+  g.gain.setValueAtTime((g0||0.5),t);g.gain.exponentialRampToValueAtTime(0.001,t+0.22);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.25);
+}
+/* 鼓 Kick */
+function kick(t,g0){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sine';
+  o.frequency.setValueAtTime(160,t);o.frequency.exponentialRampToValueAtTime(44,t+0.11);
+  g.gain.setValueAtTime(0.85*(g0||1),t);g.gain.exponentialRampToValueAtTime(0.001,t+0.3);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.35);
+  const c=AC.createOscillator(),cg=AC.createGain();c.type='square';c.frequency.value=900;
+  cg.gain.setValueAtTime(0.08*(g0||1),t);cg.gain.exponentialRampToValueAtTime(0.001,t+0.015);
+  c.connect(cg);cg.connect(master);c.start(t);c.stop(t+0.02);
+}
+function subdrop(t){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sine';
+  o.frequency.setValueAtTime(70,t);o.frequency.exponentialRampToValueAtTime(26,t+1.1);
+  g.gain.setValueAtTime(0.45,t);g.gain.exponentialRampToValueAtTime(0.001,t+1.4);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+1.5);
+}
+function snare(t,g0){
+  const s=noise(t,0.25);
+  const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=1900;f.Q.value=0.7;
+  const g=AC.createGain();g.gain.setValueAtTime(0.24*(g0||1),t);g.gain.exponentialRampToValueAtTime(0.001,t+0.15);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+function hat(t,g0){
+  const s=noise(t,0.08);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=8000;
+  const g=AC.createGain();g.gain.setValueAtTime((g0||0.07),t);g.gain.exponentialRampToValueAtTime(0.001,t+0.04);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+/* 琴键音（拨弦质感） */
+function plink(t,m,g0){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='triangle';o.frequency.value=FQ(m);
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime((g0||0.3),t+0.006);
+  g.gain.exponentialRampToValueAtTime(0.001,t+0.34);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.4);
+  const o2=AC.createOscillator(),g2=AC.createGain();o2.type='sine';o2.frequency.value=FQ(m)*2;
+  g2.gain.setValueAtTime((g0||0.3)*0.3,t);g2.gain.exponentialRampToValueAtTime(0.001,t+0.12);
+  o2.connect(g2);g2.connect(master);o2.start(t);o2.stop(t+0.15);
+  const s=noise(t,0.02);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=3000;
+  const g3=AC.createGain();g3.gain.setValueAtTime(0.05,t);g3.gain.exponentialRampToValueAtTime(0.001,t+0.015);
+  s.connect(f);f.connect(g3);g3.connect(master);
+}
+/* 齿轮木鱼 */
+function wood(t){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sine';o.frequency.value=820;
+  g.gain.setValueAtTime(0.24,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.05);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.06);
+}
+/* 镲 */
+function cymbal(t){
+  const s=noise(t,1.4);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=5800;
+  const g=AC.createGain();g.gain.setValueAtTime(0.22,t);g.gain.exponentialRampToValueAtTime(0.001,t+1.3);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+function crash(t){
+  const s=noise(t,2.2);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=5000;
+  const g=AC.createGain();g.gain.setValueAtTime(0.26,t);g.gain.exponentialRampToValueAtTime(0.001,t+2.0);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+function bassN(t,m,dur){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sawtooth';o.frequency.value=FQ(m);
+  const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=420;
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(0.2,t+0.015);
+  g.gain.setValueAtTime(0.2,t+dur*0.7);g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(f);f.connect(g);g.connect(master);o.start(t);o.stop(t+dur+0.05);
+}
+function suspenseTick(t){
+  const o=AC.createOscillator(),g=AC.createGain();o.type='sine';o.frequency.value=640;
+  g.gain.setValueAtTime(0.16,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.04);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+0.05);
+}
+function rustle(t){
+  const s=noise(t,0.4);
+  const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=900;
+  const g=AC.createGain();g.gain.setValueAtTime(0.05,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.35);
+  s.connect(f);f.connect(g);g.connect(master);
+}
+
+/* ====================================================================
+   总谱：全部声音事件按绝对时间预排
+   ==================================================================== */
+const KEY_MIDIS=[72,74,76,79,81,84,86,88];    // C D E G A C D E 五声上行
+function buildScore(t0){
+  const ev=[];const add=(rel,fn)=>ev.push({t:t0+rel,fn});
+  /* 打字：10 字 + 回车铃 + 撕裂 */
+  for(let i=0;i<TXT.length;i++)add(TYPE_T+i/TYPE_CPS,typeTick);
+  add(DING_T,ding);
+  add(FALL_T,crack);
+  /* 装配（时间见 BUILD_EV） */
+  BUILD_EV.forEach(e=>{
+    if(e.snd==='whoosh')add(e.t,whoosh);
+    else if(e.snd==='thud')add(e.t,t=>thud(t,e.g));
+    else add(e.t,t=>thock(t,e.g));
+  });
+  /* 小球入场 + 悬念 */
+  add(BALL_IN,t=>thock(t,0.2));
+  add(SUSP1,suspenseTick);add(SUSP2,suspenseTick);
+  add(GROOVE_T,t=>thock(t,0.22));              // 释放
+  /* 伴奏 groove：kick 0/2/4/6，snare 1/3/5/7，hat 八分，bass */
+  [0,2,4,6].forEach(b=>add(GROOVE_T+b*BEAT,t=>kick(t,0.75)));
+  [1,3,5,7].forEach(b=>add(GROOVE_T+b*BEAT,t=>snare(t,0.8)));
+  for(let e=0;e<16;e++)add(GROOVE_T+e*EIGHTH,t=>hat(t,e%2?0.05:0.08));
+  [[36,0],[31,2],[29,4],[31,6]].forEach(x=>add(GROOVE_T+x[1]*BEAT,t=>bassN(t,x[0],BEAT*1.8)));
+  /* 小球打击（编舞核心：每个落点一个音） */
+  KEY_MIDIS.forEach((m,i)=>add(GROOVE_T+(2+i)*EIGHTH,t=>plink(t,m,0.32)));   // 8 键
+  add(GROOVE_T+10*EIGHTH,wood);                                             // 齿轮1
+  add(GROOVE_T+11*EIGHTH,wood);                                             // 齿轮2
+  add(GROOVE_T+12*EIGHTH,t=>plink(t,81,0.26));                              // 钉1
+  add(GROOVE_T+13*EIGHTH,t=>plink(t,79,0.26));                              // 钉2
+  add(GROOVE_T+14*EIGHTH,t=>plink(t,76,0.26));                              // 钉3
+  add(GROOVE_T+16*EIGHTH,t=>{kick(t,1);subdrop(t);});                       // 大鼓（节拍8）
+  add(GROOVE_T+20*EIGHTH,cymbal);                                           // 镲（节拍10）
+  add(SNAP_T,t=>{kick(t,1.15);crash(t);subdrop(t);});                       // 终击（节拍12）
+  add(28.6,rustle);
+  ev.sort((a,b)=>a.t-b.t);return ev;
+}
+
+/* ---------------- 播放控制 ---------------- */
+let started=false,playing=false,ended=false,t0=0,evIdx=0,events=[],timerId=null;
+function songT(){return (!started||!AC)?0:(AC.currentTime-t0);}
+function startPlayback(){
+  initAudio();AC.resume();
+  t0=AC.currentTime+0.25;events=buildScore(t0);evIdx=0;ended=false;
+  master.gain.cancelScheduledValues(AC.currentTime);
+  master.gain.setValueAtTime(0.9,AC.currentTime);
+  /* 终击后全曲骤停 */
+  master.gain.setValueAtTime(0.9,t0+26.55);
+  master.gain.linearRampToValueAtTime(0.0001,t0+26.8);
+  master.gain.setValueAtTime(0.0001,t0+26.85);
+  timerId=setInterval(()=>{
+    if(!AC)return;
+    const now=AC.currentTime,hor=now+0.5;
+    while(evIdx<events.length&&events[evIdx].t<hor){
+      if(events[evIdx].t>=now-0.02){try{events[evIdx].fn(events[evIdx].t);}catch(e){}}
+      evIdx++;
+    }
+  },40);
+  started=true;playing=true;updateUI();
+}
+function togglePlay(){
+  if(ended){restart();return;}
+  if(!started){startPlayback();return;}
+  if(playing){AC.suspend();playing=false;}else{AC.resume();playing=true;}
+  updateUI();
+}
+function restart(){
+  if(timerId){clearInterval(timerId);timerId=null;}
+  if(AC){try{AC.close();}catch(e){}}
+  AC=null;master=null;
+  started=false;playing=false;ended=false;
+  letters.length=0;rings.length=0;trail.length=0;
+  shakeA=0;flashA=0;keyFlash.fill(0);
+  startPlayback();
+}
+
+/* ====================================================================
+   编舞：小球路径（节拍网格 → 抛物线反推）
+   ==================================================================== */
+const KT=425;                                  // 琴键顶面 y
+const keyX=i=>480+(i-1)*50+23;                 // 第 i 键中心 x
+const SEGS=[
+  {t0:20.00,t1:20.42,type:'line',x0:170,y0:150,x1:455,y1:395,ease:'in'},
+  {t0:20.42,t1:20.50,type:'arc', x0:455,y0:395,x1:keyX(1),y1:KT,h:20},
+];
+for(let i=1;i<8;i++){
+  SEGS.push({t0:20.50+(i-1)*0.25,t1:20.50+i*0.25,type:'arc',
+    x0:keyX(i),y0:KT,x1:keyX(i+1),y1:KT,h:26});
+}
+SEGS.push(
+  {t0:22.25,t1:22.50,type:'arc',x0:keyX(8),y0:KT,x1:985,y1:461,h:40},
+  {t0:22.50,t1:22.75,type:'arc',x0:985,y0:461,x1:1060,y1:508,h:8},
+  {t0:22.75,t1:23.00,type:'arc',x0:1060,y0:508,x1:1090,y1:505,h:20},
+  {t0:23.00,t1:23.25,type:'arc',x0:1090,y0:505,x1:1120,y1:550,h:14},
+  {t0:23.25,t1:23.50,type:'arc',x0:1120,y0:550,x1:1090,y1:590,h:14},
+  {t0:23.50,t1:24.00,type:'arc',x0:1090,y0:590,x1:950,y1:587,h:70},
+  {t0:24.00,t1:25.00,type:'arc',x0:950,y0:587,x1:640,y1:616,h:170},
+  {t0:25.00,t1:26.00,type:'arc',x0:640,y0:616,x1:425,y1:615,h:60},
+  {t0:26.00,t1:26.30,type:'arc',x0:425,y0:615,x1:415,y1:615,h:20}
+);
+function ballPos(t){
+  if(t<BALL_IN)return null;
+  if(t<20.0){                                  // 入场：滚动到滑梯顶
+    const u=(t-BALL_IN)/2.0;
+    return {x:40+u*130,y:130,rest:false};
+  }
+  if(t>=26.30)return {x:415,y:615,rest:true};
+  for(const s of SEGS){
+    if(t>=s.t0&&t<s.t1){
+      let u=(t-s.t0)/(s.t1-s.t0);
+      if(s.ease==='in')u=u*u;
+      const x=s.x0+(s.x1-s.x0)*u;
+      let y;
+      if(s.type==='line')y=s.y0+(s.y1-s.y0)*u;
+      else y=s.y0+(s.y1-s.y0)*u-4*s.h*u*(1-u);
+      return {x,y,rest:false};
+    }
+  }
+  return {x:415,y:615,rest:true};
+}
+/* 打击时刻表（用于压扁动画 / 闪光 / 涟漪） */
+const HITS=[
+  ...KEY_MIDIS.map((m,i)=>({t:GROOVE_T+(2+i)*EIGHTH,key:i})),
+  {t:22.5,gear:0},{t:22.75,gear:1},
+  {t:23.0,peg:0},{t:23.25,peg:1},{t:23.5,peg:2},
+  {t:24.0,drum:true},{t:25.0,cym:true},{t:26.0,pad:true}
+];
+
+/* ====================================================================
+   机器零件（装配时间线）
+   ==================================================================== */
+const BUILD_EV=[
+  {t:9.3, part:'floor',snd:'whoosh'},
+  {t:9.3, part:'ramp1',snd:'whoosh'},
+  {t:10.3,part:'gear1',snd:'thud',g:0.5},
+  {t:10.9,part:'gear2',snd:'thud',g:0.45},
+  ...[0,1,2,3,4,5,6,7].map(i=>({t:11.5+i*0.32,part:'key'+i,snd:'thock',g:0.3})),
+  {t:14.2,part:'peg0',snd:'thock',g:0.3},
+  {t:14.6,part:'peg1',snd:'thock',g:0.3},
+  {t:15.0,part:'peg2',snd:'thock',g:0.3},
+  {t:15.5,part:'drum',snd:'thud',g:0.65},
+  {t:16.3,part:'cym',snd:'thock',g:0.4},
+  {t:17.0,part:'pad',snd:'thud',g:0.5}
+];
+const partT={};BUILD_EV.forEach(e=>{if(!(e.part in partT))partT[e.part]=e.t;});
+function partAlpha(t,part,dur){
+  const a=(t-partT[part])/(dur||0.2);
+  return Math.max(0,Math.min(1,a));
+}
+
+/* ====================================================================
+   渲染
+   ==================================================================== */
+const cv=document.getElementById('cv'),cx=cv.getContext('2d');
+const frame=document.getElementById('frame'),overlay=document.getElementById('overlay');
+function fit(){
+  const aw=window.innerWidth-24,ah=window.innerHeight-24,ar=W/H;
+  let w=aw,h=w/ar;if(h>ah){h=ah;w=h*ar;}
+  frame.style.width=w+'px';frame.style.height=h+'px';
+}
+window.addEventListener('resize',fit);fit();
+const KAI='"KaiTi","STKaiti",serif';
+const MONO='"Cascadia Code","Consolas",monospace';
+const HEAVY='"Arial Black","Archivo Black",sans-serif';
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const smooth=u=>{u=clamp(u,0,1);return u*u*(3-2*u);};
+
+/* 纸面噪点 */
+const GRAIN=document.createElement('canvas');
+(function(){GRAIN.width=200;GRAIN.height=200;
+  const g=GRAIN.getContext('2d'),id=g.createImageData(200,200);
+  for(let i=0;i<id.data.length;i+=4){const v=200+Math.floor(Math.random()*55);
+    id.data[i]=v;id.data[i+1]=v-8;id.data[i+2]=v-25;id.data[i+3]=18;}
+  g.putImageData(id,0,0);})();
+
+/* 状态 */
+const letters=[];         // 坠落的字母刚体
+const rings=[];           // 涟漪
+const trail=[];           // 小球拖尾
+const keyFlash=new Array(8).fill(0);
+let shakeA=0,flashA=0;
+let camX=640,camY=380,camZ=1;
+
+/* 打字布局（供坠落刚体使用） */
+const CHAR_W=56,TYPE_Y=330;
+const typeX=i=>(W-CHAR_W*TXT.length)/2+i*CHAR_W;
+
+/* 硬阴影工具 */
+function hardShadow(drawFn){
+  cx.save();cx.translate(6,6);cx.globalAlpha*=0.14;cx.fillStyle=INK;drawFn(true);cx.restore();
+  drawFn(false);
+}
+
+/* ---------------- 零件绘制 ---------------- */
+function drawRamp1(a){
+  if(a<=0)return;
+  cx.save();cx.globalAlpha=a;
+  const slide=(1-smooth(a))*-260;
+  cx.translate(slide,0);
+  cx.save();cx.translate(312,272);cx.rotate(0.647);
+  cx.fillStyle=BLUE;cx.fillRect(-155,-9,310,18);
+  cx.strokeStyle=INK;cx.lineWidth=3;cx.strokeRect(-155,-9,310,18);
+  cx.restore();cx.restore();
+}
+function drawGear(cx0,cy0,r,teeth,rot,col,a){
+  if(a<=0)return;
+  cx.save();cx.globalAlpha=a;
+  const sc=0.3+0.7*smooth(a);
+  cx.translate(cx0,cy0);cx.scale(sc,sc);cx.rotate(rot);
+  cx.fillStyle=col;
+  for(let i=0;i<teeth;i++){
+    cx.save();cx.rotate(i*6.283/teeth);
+    cx.fillRect(r-4,-5,12,10);cx.restore();
+  }
+  cx.beginPath();cx.arc(0,0,r,0,6.283);cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=3;
+  cx.beginPath();cx.arc(0,0,r,0,6.283);cx.stroke();
+  for(let i=0;i<4;i++){
+    cx.save();cx.rotate(i*6.283/4+0.4);
+    cx.strokeStyle=PAPER;cx.lineWidth=7;
+    cx.beginPath();cx.moveTo(8,0);cx.lineTo(r-8,0);cx.stroke();cx.restore();
+  }
+  cx.fillStyle=RED;cx.beginPath();cx.arc(0,0,9,0,6.283);cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=3;cx.stroke();
+  cx.restore();
+}
+function drawKeys(t,a){
+  for(let i=0;i<8;i++){
+    const pa=partAlpha(t,'key'+i);
+    if(pa<=0)continue;
+    const x=480+i*50,y=430;
+    const sc=0.3+0.7*smooth(pa);
+    cx.save();cx.globalAlpha=Math.min(1,pa);
+    cx.translate(x+23,y+45);cx.scale(sc,sc);cx.translate(-(x+23),-(y+45));
+    const fl=Math.max(0,keyFlash[i]-t);
+    cx.fillStyle=fl>0?KEY_COLS[i]:WHITE;
+    cx.fillRect(x,y,46,90);
+    cx.strokeStyle=INK;cx.lineWidth=3;cx.strokeRect(x,y,46,90);
+    cx.fillStyle=INK;cx.beginPath();cx.arc(x+23,y+72,4,0,6.283);cx.fill();
+    cx.restore();
+  }
+}
+function drawPegs(t){
+  [[1090,510],[1120,555],[1090,595]].forEach((pg,i)=>{
+    const a=partAlpha(t,'peg'+i);if(a<=0)return;
+    cx.save();cx.globalAlpha=a;
+    cx.fillStyle=INK;cx.beginPath();cx.arc(pg[0],pg[1],7,0,6.283);cx.fill();
+    cx.fillStyle=YEL;cx.beginPath();cx.arc(pg[0]-2,pg[1]-2,2.5,0,6.283);cx.fill();
+    cx.restore();
+  });
+}
+function drawDrum(t){
+  const a=partAlpha(t,'drum');if(a<=0)return;
+  let sq=1;
+  if(t>24&&t<24.25)sq=1-0.18*Math.sin((t-24)/0.25*Math.PI);
+  cx.save();cx.globalAlpha=a;
+  const sc=(0.3+0.7*smooth(a))*1;
+  cx.translate(950,645);cx.scale(sc,sc*sq);cx.translate(-950,-645);
+  cx.fillStyle=RED;cx.beginPath();cx.arc(950,645,58,0,6.283);cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=4;cx.stroke();
+  cx.fillStyle=PAPER;cx.beginPath();cx.arc(950,645,42,0,6.283);cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=3;cx.stroke();
+  cx.fillStyle=INK;cx.beginPath();cx.arc(950,645,7,0,6.283);cx.fill();
+  cx.restore();
+}
+function drawCymbal(t){
+  const a=partAlpha(t,'cym');if(a<=0)return;
+  let wob=0;
+  if(t>25&&t<25.8)wob=Math.sin((t-25)*30)*0.12*(1-(t-25)/0.8);
+  cx.save();cx.globalAlpha=a;
+  const sc=0.3+0.7*smooth(a);
+  cx.translate(640,620);cx.scale(sc,sc);cx.rotate(wob);cx.translate(-640,-620);
+  cx.fillStyle=YEL;cx.beginPath();cx.ellipse(640,620,70,14,0,0,6.283);cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=3;cx.stroke();
+  cx.fillStyle='#ffe89a';cx.beginPath();cx.ellipse(640,616,34,6,0,0,6.283);cx.fill();
+  cx.restore();
+}
+function drawPad(t){
+  const a=partAlpha(t,'pad');if(a<=0)return;
+  let glow=0;
+  if(t>26&&t<26.5)glow=1-(t-26)/0.5;
+  cx.save();cx.globalAlpha=a;
+  const sc=0.3+0.7*smooth(a);
+  cx.translate(415,640);cx.scale(sc,sc);cx.translate(-415,-640);
+  cx.fillStyle=RED;
+  cx.beginPath();cx.roundRect(360,620,110,36,8);cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=4;cx.stroke();
+  cx.fillStyle=WHITE;cx.font='700 20px '+MONO;cx.textAlign='center';cx.textBaseline='middle';
+  cx.fillText('HIT',415,639);
+  if(glow>0){
+    cx.strokeStyle='rgba(232,87,42,'+glow.toFixed(3)+')';cx.lineWidth=6;
+    cx.beginPath();cx.roundRect(360-8,620-8,110+16,36+16,12);cx.stroke();
+  }
+  cx.restore();
+}
+function drawFloor(t){
+  const a=partAlpha(t,'floor',0.3);if(a<=0)return;
+  cx.save();cx.globalAlpha=a;
+  cx.strokeStyle=INK;cx.lineWidth=3;
+  cx.beginPath();cx.moveTo(60,668);cx.lineTo(1220,668);cx.stroke();
+  cx.restore();
+}
+function drawBall(t){
+  const pos=ballPos(t);if(!pos)return;
+  /* 拖尾 */
+  if(playing&&!pos.rest){
+    trail.push({x:pos.x,y:pos.y,life:1});
+    if(trail.length>16)trail.shift();
+  }
+  trail.forEach(p0=>{p0.life-=0.05;
+    cx.fillStyle='rgba(26,23,18,'+(p0.life*0.16).toFixed(3)+')';
+    cx.beginPath();cx.arc(p0.x,p0.y,8*p0.life+2,0,6.283);cx.fill();});
+  /* 压扁回弹 */
+  let sq=1,st=1;
+  for(const h of HITS){
+    const d=t-h.t;
+    if(d>0&&d<0.12){const k=Math.sin(d/0.12*Math.PI);sq=1-0.26*k;st=1+0.3*k;}
+  }
+  /* 阴影 */
+  const gy=pos.y<440?668:668;
+  const shA=clamp(1-(gy-pos.y)/500,0.1,0.5)*0.25;
+  cx.fillStyle='rgba(26,23,18,'+shA.toFixed(3)+')';
+  cx.beginPath();cx.ellipse(pos.x,668,16*shA*4+6,4,0,0,6.283);cx.fill();
+  cx.save();cx.translate(pos.x,pos.y);cx.scale(st,sq);
+  cx.fillStyle=INK;cx.beginPath();cx.arc(0,0,13,0,6.283);cx.fill();
+  cx.fillStyle=PAPER;cx.beginPath();cx.arc(-4,-4,4.5,0,6.283);cx.fill();
+  cx.restore();
+}
+
+/* ---------------- 场景绘制 ---------------- */
+function drawPaper(){
+  cx.fillStyle=PAPER;cx.fillRect(0,0,W,H);
+  cx.save();cx.globalAlpha=0.5;
+  cx.drawImage(GRAIN,0,0,200,200,0,0,W,H);
+  cx.restore();
+}
+function drawCropMarks(t){
+  const a=smooth(t/0.5)*0.55;
+  if(a<=0)return;
+  cx.save();cx.globalAlpha=a;cx.strokeStyle=INK;cx.lineWidth=2;
+  const m=30,l=16;
+  [[m,m,1,1],[W-m,m,-1,1],[m,H-m,1,-1],[W-m,H-m,-1,-1]].forEach(c=>{
+    cx.beginPath();
+    cx.moveTo(c[0]+c[2]*l,c[1]);cx.lineTo(c[0],c[1]);cx.lineTo(c[0],c[1]+c[3]*l);
+    cx.stroke();
+  });
+  cx.font='11px '+MONO;cx.fillStyle=INK;cx.textBaseline='middle';
+  cx.textAlign='left';
+  cx.fillText('FRI-MACHINE N°01',m+24,m+3);
+  cx.fillText('单文件 HTML · 纯代码无素材',m+24,H-m+3);
+  cx.textAlign='right';
+  cx.fillText('120 BPM · 32s',W-m-24,m+3);
+  cx.fillText('星期五 · 一条成片',W-m-24,H-m+3);
+  cx.restore();
+}
+function drawTyping(t){
+  if(t<TYPE_T-0.5||t>FALL_T+0.3)return;
+  const typed=clamp(Math.floor((t-TYPE_T)*TYPE_CPS),0,TXT.length);
+  cx.save();
+  cx.font='700 52px '+KAI;cx.textBaseline='middle';cx.textAlign='center';
+  for(let i=0;i<typed;i++){
+    cx.fillStyle=INK;
+    cx.fillText(TXT[i],typeX(i)+CHAR_W/2,TYPE_Y);
+  }
+  if(typed<TXT.length&&(t*2.4)%1<0.6){
+    cx.fillStyle=RED;
+    cx.fillRect(typeX(typed)+6,TYPE_Y-26,14,52);
+  }
+  cx.restore();
+}
+function stepLetters(t,dt){
+  if(t>FALL_T&&letters.length===0&&t<FALL_T+0.1){
+    for(let i=0;i<TXT.length;i++){
+      letters.push({
+        x:typeX(i)+CHAR_W/2,y:TYPE_Y,ch:TXT[i],
+        vx:(Math.random()-0.5)*180,vy:-Math.random()*120,
+        rot:0,vr:(Math.random()-0.5)*9,bounced:false
+      });
+    }
+  }
+  letters.forEach(L=>{
+    L.vy+=1500*dt;L.x+=L.vx*dt;L.y+=L.vy*dt;L.rot+=L.vr*dt;
+    if(!L.bounced&&L.y>640){L.y=640;L.vy*=-0.42;L.vx*=0.7;L.vr*=0.6;L.bounced=true;}
+  });
+  const fade=1-smooth((t-8.9)/0.6);
+  if(letters.length&&fade>0){
+    cx.save();cx.font='700 52px '+KAI;cx.textBaseline='middle';cx.textAlign='center';
+    letters.forEach(L=>{
+      cx.save();cx.globalAlpha=fade;
+      cx.translate(L.x,L.y);cx.rotate(L.rot);
+      cx.fillStyle=INK;cx.fillText(L.ch,0,0);
+      cx.restore();
+    });
+    cx.restore();
+  }
+}
+function drawMachine(t){
+  if(t>SNAP_T+0.05)return;
+  drawFloor(t);
+  drawRamp1(partAlpha(t,'ramp1',0.35));
+  const gRot=t*0.9;
+  drawGear(985,505,44,12,gRot,BLUE,partAlpha(t,'gear1',0.3));
+  drawGear(1060,540,32,9,-gRot*44/32+0.35,YEL,partAlpha(t,'gear2',0.3));
+  drawKeys(t,1);
+  drawPegs(t);
+  drawDrum(t);
+  drawCymbal(t);
+  drawPad(t);
+}
+function drawRings(t){
+  for(let i=rings.length-1;i>=0;i--){
+    const r=rings[i],u=(t-r.t)/0.55;
+    if(u>1){rings.splice(i,1);continue;}
+    cx.strokeStyle='rgba(26,23,18,'+((1-u)*0.5*r.k).toFixed(3)+')';
+    cx.lineWidth=3*(1-u)+1;
+    cx.beginPath();cx.arc(r.x,r.y,8+u*r.max,0,6.283);cx.stroke();
+  }
+}
+function spawnHitFX(t){
+  for(const h of HITS){
+    if(Math.abs(t-h.t)<0.03){
+      const pos=ballPos(h.t+0.001);
+      if(pos)rings.push({t:h.t,x:pos.x,y:pos.y,max:h.drum?80:(h.pad?90:40),k:h.drum||h.pad?1.4:0.7});
+      if(h.key!==undefined)keyFlash[h.key]=h.t+0.28;
+      if(h.drum)shakeA=Math.max(shakeA,7);
+      if(h.pad){shakeA=Math.max(shakeA,11);flashA=0.9;}
+    }
+  }
+}
+/* ONE TAKE 标题 */
+function drawTitle(t){
+  if(t<SNAP_T)return;
+  cx.fillStyle=PAPER;cx.fillRect(0,0,W,H);
+  cx.save();cx.globalAlpha=0.5;cx.drawImage(GRAIN,0,0,200,200,0,0,W,H);cx.restore();
+  drawCropMarks(1);
+  const word='ONE TAKE';
+  cx.textAlign='center';cx.textBaseline='middle';
+  let idx=0;
+  cx.font='900 128px '+HEAVY;
+  const totalW=8*86;
+  for(const ch of word){
+    if(ch!==' '){
+      const dt0=SNAP_T+0.12+idx*0.07,u=smooth((t-dt0)/0.28);
+      const sc=u<=0?0:(0.4+0.6*u+0.25*Math.sin(u*Math.PI)*(1-u));
+      const x=W/2-totalW/2+idx*86+43,y=330;
+      if(u>0){
+        cx.save();cx.translate(x,y);cx.scale(sc,sc);
+        cx.fillStyle=idx<3?INK:RED;
+        cx.fillText(ch,0,0);
+        cx.restore();
+      }
+      idx++;
+    } else idx+=0.5;
+  }
+  const a2=smooth((t-(SNAP_T+0.9))/0.6);
+  if(a2>0){
+    cx.save();cx.globalAlpha=a2;
+    cx.font='700 26px '+KAI;cx.fillStyle=INK;
+    cx.fillText('星期五 · 一条成片 · 每个声音都有一个动作',W/2,440);
+    cx.font='13px '+MONO;cx.fillStyle='rgba(26,23,18,0.5)';
+    cx.fillText('HOMAGE TO "MOTION GRAPHICS MUSIC MACHINE" · AWESOME-OPUS5-5-VIDEOS',W/2,486);
+    cx.strokeStyle=RED;cx.lineWidth=4;
+    cx.beginPath();cx.moveTo(W/2-180,410);cx.lineTo(W/2+180,410);cx.stroke();
+    cx.restore();
+  }
+}
+
+/* ---------------- 相机 ---------------- */
+function camTarget(t){
+  if(t<7.3)return {x:640,y:340,z:1.03};
+  if(t<9.4)return {x:640,y:400,z:1.0};
+  if(t<18)return {x:640,y:400,z:0.97};
+  if(t<20)return {x:420,y:320,z:1.06};
+  if(t<26.3){
+    const pos=ballPos(t)||{x:640,y:400};
+    return {x:pos.x*0.5+640*0.5,y:pos.y*0.35+400*0.65,z:1.09};
+  }
+  return {x:640,y:360,z:1.0};
+}
+
+/* ---------------- 主循环 ---------------- */
+let lastTs=0;
+function render(ts){
+  const dt=Math.min(0.05,(ts-lastTs)/1000||0.016);lastTs=ts;
+  const t=clamp(songT(),0,DUR);
+  spawnHitFX(t);
+  shakeA*=Math.exp(-dt*5);
+  flashA*=Math.exp(-dt*10);
+
+  /* 相机平滑 */
+  const ct=camTarget(t);
+  camX+=(ct.x-camX)*Math.min(1,dt*4);
+  camY+=(ct.y-camY)*Math.min(1,dt*4);
+  camZ+=(ct.z-camZ)*Math.min(1,dt*3);
+
+  cx.clearRect(0,0,W,H);
+  if(t<SNAP_T||t>=SNAP_T){
+    cx.save();
+    const shx=(Math.random()-0.5)*shakeA,shy=(Math.random()-0.5)*shakeA;
+    cx.translate(640+shx,360+shy);cx.scale(camZ,camZ);cx.translate(-camX,-camY);
+    if(t<SNAP_T+0.05){
+      drawPaper();
+      drawTyping(t);
+      stepLetters(t,dt);
+      drawMachine(t);
+      drawBall(t);
+      drawRings(t);
+    }
+    cx.restore();
+    if(t<SNAP_T+0.05)drawCropMarks(t);
+  }
+  if(t>=SNAP_T)drawTitle(t);
+  /* 白闪 */
+  if(flashA>0.01){cx.fillStyle='rgba(253,250,242,'+flashA.toFixed(3)+')';cx.fillRect(0,0,W,H);}
+  /* 结尾黑场 */
+  const ef=smooth((t-FADE_T)/1);
+  if(ef>0){cx.fillStyle='rgba(10,9,8,'+ef.toFixed(3)+')';cx.fillRect(0,0,W,H);}
+  /* 暂停 */
+  if(started&&!playing&&!ended){
+    cx.fillStyle='rgba(20,18,16,0.55)';cx.fillRect(0,0,W,H);
+    cx.fillStyle='#f2e8d5';cx.font='700 44px '+KAI;
+    cx.textAlign='center';cx.textBaseline='middle';
+    cx.fillText('暂 停',640,340);
+  }
+  if(started&&!ended&&songT()>DUR+0.4){ended=true;playing=false;updateUI();}
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ---------------- UI ---------------- */
+function updateUI(){
+  const btn=document.getElementById('playBtn'),hint=document.getElementById('hint');
+  if(ended){
+    overlay.style.display='flex';btn.innerHTML='&#8635;';
+    hint.innerHTML='播放结束<br>点击重新播放';
+  }else if(!started){
+    overlay.style.display='flex';btn.innerHTML='&#9654;';
+    hint.innerHTML='ONE TAKE · 音乐机器<small>CHOREOGRAPHED PHYSICS · 120 BPM GRID · EVERY SOUND HAS A MOVEMENT<br>点击播放 · 空格暂停 · R 重播</small>';
+  }else{
+    overlay.style.display='none';
+  }
+}
+overlay.addEventListener('click',togglePlay);
+cv.addEventListener('click',togglePlay);
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){e.preventDefault();togglePlay();}
+  else if(e.key==='r'||e.key==='R'){restart();}
+});
+updateUI();
+</script>
+</body>
+</html>

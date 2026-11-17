@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>日不落 · 像素终端 MV</title>
+<style>
+  html,body{margin:0;height:100%;background:#0a0812;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #frame{position:relative}
+  canvas{display:block;width:100%;height:auto;border-radius:8px;box-shadow:0 30px 100px rgba(0,0,0,.75), 0 0 80px rgba(232,131,74,.10);image-rendering:pixelated}
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;cursor:pointer;border-radius:8px;background:rgba(10,8,18,.78)}
+  #playBtn{width:92px;height:92px;border-radius:10px;background:rgba(232,131,74,.12);border:2px solid #e8834a;color:#ffb37a;font-size:34px;display:flex;align-items:center;justify-content:center;padding-left:6px;transition:transform .15s;box-shadow:0 0 50px rgba(232,131,74,.30)}
+  #overlay:hover #playBtn{transform:scale(1.07)}
+  #hint{color:#cfc4de;font-size:15px;letter-spacing:3px;text-align:center;line-height:2;font-family:"KaiTi","STKaiti",serif}
+  #hint small{display:block;color:#8f84a5;font-size:12px;font-family:"Cascadia Code","Consolas",monospace;letter-spacing:2px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="frame">
+    <canvas id="cv" width="1280" height="720"></canvas>
+    <div id="overlay">
+      <div id="playBtn">&#9654;</div>
+      <div id="hint">日不落 · 像素终端MV<small>PIXEL TERMINAL TRIBUTE · 320×180 → ×4 · 128 BPM<br>点击播放 · 空格暂停 · R 重播</small></div>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+/* =====================================================================
+   日不落 · 像素终端 MV —— 复刻像素风终端 MV 的视觉语言
+   320×180 低分辨率场景渲染 → ×4 像素放大（真像素锯齿）
+   Web Audio 实时合成编曲 + FFT 驱动纸屑/太阳/禁卫军
+   ===================================================================== */
+
+/* ---------------- 时间与曲式 ---------------- */
+const LW=320, LH=180;                     // 低分辨率画布
+const BPM=128, BEAT=60/BPM, BAR=BEAT*4;   // 0.46875 / 1.875
+const TOTAL_BARS=32, DUR=TOTAL_BARS*BAR;  // 60s
+
+const SEC_DEF=[['intro',0,4],['verse',4,12],['pre',12,16],['chorus',16,24],['chorus2',24,30],['outro',30,32]];
+const SECS=SEC_DEF.map(s=>({name:s[0],t0:s[1]*BAR,t1:s[2]*BAR}));
+const PROG={
+  intro:['F','G','Am','Em'],
+  verse:['Am','F','C','G','Am','F','C','G'],
+  pre:['Dm','Em','F','G'],
+  chorus:['C','G','Am','F','C','G','F','G'],
+  chorus2:['Am','F','C','G','Am','F'],
+  outro:['F','C']
+};
+const CHORDS={
+  C:{bass:36,pad:[60,64,67],arp:[60,64,67,72]},
+  G:{bass:31,pad:[55,59,62],arp:[55,59,62,67]},
+  Am:{bass:33,pad:[57,60,64],arp:[57,60,64,69]},
+  F:{bass:29,pad:[57,60,65],arp:[57,60,65,69]},
+  Em:{bass:28,pad:[55,59,64],arp:[55,59,64,67]},
+  Dm:{bass:26,pad:[57,62,65],arp:[57,62,65,69]}
+};
+function secOfBar(b){const t=b*BAR;for(const s of SECS){if(t>=s.t0-1e-9&&t<s.t1-1e-9)return s.name;}return 'outro';}
+function chordAtBar(b){const n=secOfBar(b);const s=SECS.filter(x=>x.name===n)[0];
+  const local=Math.round((b*BAR-s.t0)/BAR);return PROG[n][local%PROG[n].length];}
+function poolOf(ch){const p=CHORDS[ch].pad;return [p[0]+12,p[1]+12,p[2]+12,p[0]+24];}
+
+/* ====================================================================
+   音频引擎（沿用 v2：sidechain 泵感 / supersaw / riser+subdrop）
+   ==================================================================== */
+let AC=null,master=null,duck=null,analyser=null,freqData=null,noiseBuf=null;
+function initAudio(){
+  if(AC)return;
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain();master.gain.value=0.85;
+  analyser=AC.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=0.55;
+  freqData=new Uint8Array(analyser.frequencyBinCount);
+  const comp=AC.createDynamicsCompressor();
+  comp.threshold.value=-16;comp.ratio.value=4;comp.attack.value=0.004;comp.release.value=0.24;
+  master.connect(analyser);analyser.connect(comp);comp.connect(AC.destination);
+  duck=AC.createGain();duck.gain.value=1;duck.connect(master);
+  noiseBuf=AC.createBuffer(1,AC.sampleRate*2,AC.sampleRate);
+  const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+}
+const FQ=m=>440*Math.pow(2,(m-69)/12);
+function noise(t,dur){const s=AC.createBufferSource();s.buffer=noiseBuf;s.loop=true;s.start(t);s.stop(t+dur);return s;}
+function kick(t,g){
+  const o=AC.createOscillator(),ga=AC.createGain();o.type='sine';
+  o.frequency.setValueAtTime(160,t);o.frequency.exponentialRampToValueAtTime(44,t+0.11);
+  ga.gain.setValueAtTime(0.9*g,t);ga.gain.exponentialRampToValueAtTime(0.001,t+0.3);
+  o.connect(ga);ga.connect(master);o.start(t);o.stop(t+0.35);
+  const c=AC.createOscillator(),cg=AC.createGain();c.type='square';c.frequency.value=900;
+  cg.gain.setValueAtTime(0.10*g,t);cg.gain.exponentialRampToValueAtTime(0.001,t+0.015);
+  c.connect(cg);cg.connect(master);c.start(t);c.stop(t+0.02);
+  duck.gain.setValueAtTime(0.30,t);duck.gain.linearRampToValueAtTime(1.0,t+0.26);
+}
+function hat(t,g,open){
+  const s=noise(t,open?0.7:0.1);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=8000;
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime((open?0.13:0.08)*g,t);
+  ga.gain.exponentialRampToValueAtTime(0.001,t+(open?0.5:0.04));
+  s.connect(f);f.connect(ga);ga.connect(master);
+}
+function snare(t,g){
+  const s=noise(t,0.3);
+  const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=1900;f.Q.value=0.7;
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0.30*g,t);ga.gain.exponentialRampToValueAtTime(0.001,t+0.17);
+  s.connect(f);f.connect(ga);ga.connect(master);
+  const o=AC.createOscillator(),g2=AC.createGain();o.type='triangle';o.frequency.value=200;
+  g2.gain.setValueAtTime(0.15*g,t);g2.gain.exponentialRampToValueAtTime(0.001,t+0.08);
+  o.connect(g2);g2.connect(master);o.start(t);o.stop(t+0.09);
+}
+function crash(t,g){
+  const s=noise(t,2.4);
+  const f=AC.createBiquadFilter();f.type='highpass';f.frequency.value=5500;
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0.22*g,t);ga.gain.exponentialRampToValueAtTime(0.001,t+2.2);
+  s.connect(f);f.connect(ga);ga.connect(master);
+}
+function riser(t,dur){
+  const s=noise(t,dur);
+  const f=AC.createBiquadFilter();f.type='bandpass';f.Q.value=1.2;
+  f.frequency.setValueAtTime(300,t);f.frequency.exponentialRampToValueAtTime(6500,t+dur);
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0.001,t);ga.gain.exponentialRampToValueAtTime(0.16,t+dur*0.92);
+  ga.gain.linearRampToValueAtTime(0.0001,t+dur);
+  s.connect(f);f.connect(ga);ga.connect(master);
+  const o=AC.createOscillator(),og=AC.createGain();o.type='sawtooth';
+  o.frequency.setValueAtTime(110,t);o.frequency.exponentialRampToValueAtTime(440,t+dur);
+  og.gain.setValueAtTime(0.001,t);og.gain.exponentialRampToValueAtTime(0.05,t+dur*0.9);
+  og.gain.linearRampToValueAtTime(0.0001,t+dur);
+  o.connect(og);og.connect(master);o.start(t);o.stop(t+dur);
+}
+function subdrop(t){
+  const o=AC.createOscillator(),ga=AC.createGain();o.type='sine';
+  o.frequency.setValueAtTime(70,t);o.frequency.exponentialRampToValueAtTime(27,t+1.3);
+  ga.gain.setValueAtTime(0.5,t);ga.gain.exponentialRampToValueAtTime(0.001,t+1.5);
+  o.connect(ga);ga.connect(master);o.start(t);o.stop(t+1.6);
+}
+function bassN(t,m,dur,g){
+  const o=AC.createOscillator();o.type='sawtooth';o.frequency.value=FQ(m);
+  const o2=AC.createOscillator();o2.type='sine';o2.frequency.value=FQ(m-12);
+  const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=480;
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0,t);ga.gain.linearRampToValueAtTime(g,t+0.012);
+  ga.gain.setValueAtTime(g,t+dur*0.65);ga.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(f);o2.connect(f);f.connect(ga);ga.connect(master);
+  o.start(t);o.stop(t+dur+0.05);o2.start(t);o2.stop(t+dur+0.05);
+}
+function padC(t,midis,dur,g){
+  const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=950;
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0,t);ga.gain.linearRampToValueAtTime(g,t+0.28);
+  ga.gain.setValueAtTime(g,t+dur*0.6);ga.gain.linearRampToValueAtTime(0.0001,t+dur);
+  f.connect(ga);ga.connect(duck);
+  midis.forEach(m=>{for(let d=-8;d<=8;d+=8){
+    const o=AC.createOscillator();o.type='sawtooth';o.frequency.value=FQ(m);o.detune.value=d;
+    o.connect(f);o.start(t);o.stop(t+dur+0.05);}});
+}
+function arpN(t,m,g){
+  const o=AC.createOscillator();o.type='triangle';o.frequency.value=FQ(m);
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0,t);ga.gain.linearRampToValueAtTime(g,t+0.006);
+  ga.gain.exponentialRampToValueAtTime(0.001,t+0.22);
+  o.connect(ga);ga.connect(duck);o.start(t);o.stop(t+0.28);
+}
+function leadSoft(t,m,dur,g){
+  const o=AC.createOscillator();o.type='triangle';o.frequency.value=FQ(m);
+  const vib=AC.createOscillator();vib.frequency.value=5.4;
+  const vg=AC.createGain();vg.gain.setValueAtTime(0,t);vg.gain.linearRampToValueAtTime(7,t+0.3);
+  vib.connect(vg);vg.connect(o.detune);
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0,t);ga.gain.linearRampToValueAtTime(g,t+0.04);
+  ga.gain.setValueAtTime(g*0.9,t+dur*0.75);ga.gain.linearRampToValueAtTime(0.0001,t+dur+0.06);
+  o.connect(ga);ga.connect(duck);o.start(t);o.stop(t+dur+0.1);vib.start(t);vib.stop(t+dur+0.1);
+}
+function leadSaw(t,m,dur,g){
+  const f=AC.createBiquadFilter();f.type='lowpass';
+  f.frequency.setValueAtTime(1400,t);f.frequency.linearRampToValueAtTime(2600,t+dur*0.5);
+  f.frequency.linearRampToValueAtTime(1600,t+dur);
+  const ga=AC.createGain();
+  ga.gain.setValueAtTime(0,t);ga.gain.linearRampToValueAtTime(g,t+0.03);
+  ga.gain.setValueAtTime(g*0.85,t+dur*0.8);ga.gain.linearRampToValueAtTime(0.0001,t+dur+0.07);
+  f.connect(ga);ga.connect(duck);
+  for(let d=-18;d<=18;d+=6){
+    const o=AC.createOscillator();o.type='sawtooth';o.frequency.value=FQ(m);o.detune.value=d;
+    o.connect(f);o.start(t);o.stop(t+dur+0.1);}
+}
+
+/* ---------------- 总谱 ---------------- */
+const DRUM={
+  intro:{kick:[],hat8:false,clap:[],bass:null},
+  verse:{kick:[0,2],hat8:true,clap:[],bass:'q'},
+  pre:{kick:[0,2],hat8:true,clap:[1,3],bass:'q'},
+  chorus:{kick:[0,1,2,3],hat8:true,clap:[1,3],bass:'o'},
+  chorus2:{kick:[0,1,2,3],hat8:true,clap:[1,3],bass:'o'},
+  outro:{kick:[],hat8:false,clap:[],bass:'w'}
+};
+const PADG={intro:0.09,verse:0.09,pre:0.11,chorus:0.12,chorus2:0.12,outro:0.08};
+const MELODY_LINES=[
+  {bar:6, pat:[0,1,2,1,2,1,2,3], saw:false},
+  {bar:10,pat:[0,1,2,1,2,1,2,3], saw:false},
+  {bar:18,pat:[0,2,1,2,3,2,1,0], saw:true},
+  {bar:22,pat:[0,2,1,2,3,2,1,0], saw:true},
+  {bar:26,pat:[0,2,1,2,3,2,1,0], saw:true}
+];
+function buildScore(t0){
+  const ev=[];const add=(rel,fn)=>ev.push({t:t0+rel,fn});
+  for(let bar=0;bar<TOTAL_BARS;bar++){
+    const bt=bar*BAR,sec=secOfBar(bar),ch=chordAtBar(bar),C=CHORDS[ch],f=DRUM[sec];
+    add(bt,t=>padC(t,C.pad,BAR+0.15,PADG[sec]));
+    f.kick.forEach(b=>add(bt+b*BEAT,t=>kick(t,1)));
+    if(f.hat8)for(let b=0;b<4;b++)add(bt+(b+0.5)*BEAT,t=>hat(t,1,false));
+    f.clap.forEach(b=>add(bt+b*BEAT,t=>snare(t,0.9)));
+    if(f.bass==='q')for(let q=0;q<4;q++)((m)=>add(bt+q*BEAT,t=>bassN(t,m,BEAT*0.72,0.20)))(C.bass);
+    else if(f.bass==='o')for(let b=0;b<4;b++)((m)=>{
+      add(bt+b*BEAT,t=>bassN(t,m,BEAT*0.42,0.19));
+      add(bt+(b+0.5)*BEAT,t=>bassN(t,m+12,BEAT*0.42,0.14));})(C.bass);
+    else if(f.bass==='w')((m)=>add(bt,t=>bassN(t,m,BAR*0.96,0.15)))(C.bass);
+    const arpSec=(sec==='intro'||sec==='outro');
+    const ag=(sec==='chorus'||sec==='chorus2')?0.055:0.042;
+    if(arpSec)for(let a=0;a<16;a++)((m)=>add(bt+a*BEAT/4,t=>arpN(t,m,0.05)))(C.arp[a%4]);
+    else for(let e=0;e<8;e++)((m)=>add(bt+e*BEAT/2,t=>arpN(t,m,ag)))(C.arp[e%4]);
+    if(sec==='chorus'||sec==='chorus2')for(let b=0;b<4;b++)add(bt+(b+0.5)*BEAT,t=>hat(t,0.9,true));
+  }
+  /* build-up 滚奏 + riser（bar 15） */
+  for(let r=0;r<16;r++)((r0,g)=>add(15*BAR+r0*BEAT/4,t=>snare(t,g)))(r,0.16+0.72*(r/15));
+  add(15*BAR,t=>riser(t,BAR));
+  /* drop */
+  add(16*BAR,t=>crash(t,1.2));add(16*BAR,t=>subdrop(t));
+  add(24*BAR,t=>crash(t,1.0));
+  /* 旋律 */
+  MELODY_LINES.forEach(line=>{
+    for(let i=0;i<8;i++){
+      const chord=chordAtBar(line.bar+(i>=4?1:0));
+      const midi=poolOf(chord)[line.pat[i]];
+      const dur=(i===7)?BEAT*1.6:BEAT*0.92;
+      const fn=line.saw?leadSaw:leadSoft;
+      const g=line.saw?0.10:0.115;
+      add(line.bar*BAR+i*BEAT,t=>fn(t,midi,dur,g));
+    }
+  });
+  ev.sort((a,b)=>a.t-b.t);return ev;
+}
+
+/* ---------------- 播放控制 ---------------- */
+let started=false,playing=false,ended=false,t0=0,evIdx=0,events=[],timerId=null;
+function songT(){return (!started||!AC)?0:(AC.currentTime-t0);}
+function startPlayback(){
+  initAudio();AC.resume();
+  t0=AC.currentTime+0.25;
+  events=buildScore(t0);evIdx=0;ended=false;
+  master.gain.cancelScheduledValues(AC.currentTime);
+  master.gain.setValueAtTime(0.85,AC.currentTime);
+  master.gain.setValueAtTime(0.85,t0+57);
+  master.gain.linearRampToValueAtTime(0.0001,t0+59.6);
+  timerId=setInterval(()=>{
+    if(!AC)return;
+    const now=AC.currentTime,hor=now+0.5;
+    while(evIdx<events.length&&events[evIdx].t<hor){
+      if(events[evIdx].t>=now-0.02){try{events[evIdx].fn(events[evIdx].t);}catch(e){}}
+      evIdx++;
+    }
+  },40);
+  started=true;playing=true;updateUI();
+}
+function togglePlay(){
+  if(ended){restart();return;}
+  if(!started){startPlayback();return;}
+  if(playing){AC.suspend();playing=false;}else{AC.resume();playing=true;}
+  updateUI();
+}
+function restart(){
+  if(timerId){clearInterval(timerId);timerId=null;}
+  if(AC){try{AC.close();}catch(e){}}
+  AC=null;master=null;duck=null;analyser=null;
+  started=false;playing=false;ended=false;
+  confetti.length=0;armySpawned=0;flashA=0;bassE=0;
+  startPlayback();
+}
+
+/* ====================================================================
+   像素渲染（低分辨率画布 → ×4 放大）
+   ==================================================================== */
+const cv=document.getElementById('cv'),cx=cv.getContext('2d');
+const frame=document.getElementById('frame'),overlay=document.getElementById('overlay');
+const LR=document.createElement('canvas');LR.width=LW;LR.height=LH;
+const p=LR.getContext('2d');
+function fit(){
+  const aw=window.innerWidth-24,ah=window.innerHeight-24,ar=1280/720;
+  let w=aw,h=w/ar;if(h>ah){h=ah;w=h*ar;}
+  frame.style.width=w+'px';frame.style.height=h+'px';
+}
+window.addEventListener('resize',fit);fit();
+cx.imageSmoothingEnabled=false;
+
+const KAI='"KaiTi","STKaiti","DFKai-SB",serif';
+const MONO='"Cascadia Code","Consolas",monospace';
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const smooth=u=>{u=clamp(u,0,1);return u*u*(3-2*u);};
+const mmss=s=>{s=Math.max(0,s);const m=Math.floor(s/60),r=Math.floor(s%60);return m+':'+(r<10?'0':'')+r;};
+function rrect(g,x,y,w,h,r){
+  g.beginPath();
+  g.moveTo(x+r,y);g.lineTo(x+w-r,y);g.arcTo(x+w,y,x+w,y+r,r);
+  g.lineTo(x+w,y+h-r);g.arcTo(x+w,y+h,x+w-r,y+h,r);
+  g.lineTo(x+r,y+h);g.arcTo(x,y+h,x,y+h-r,r);
+  g.lineTo(x,y+r);g.arcTo(x,y,x+r,y,r);g.closePath();
+}
+
+/* ---------------- 像素素材 ---------------- */
+/* 星期五像素章鱼（戴礼帽）16×12 + 帽3行 */
+const OCTO=[
+"....########....",
+"..############..",
+".##############.",
+".##ee######ee##.",
+".##ee######ee##.",
+".##############.",
+"..#####hh#####..",
+"..#####hh#####..",
+"..############..",
+".##..##..##..##.",
+".##..##..##..##.",
+".##..##..##..##."
+];
+const OCTO_COL={'#':'#e8834a','e':'#241a2e','h':'#ff5f7a'};
+const HAT=[
+"......bbbb......",
+"......b##b......",
+"..bbbbbbbbbb...."
+];
+const HAT_COL={'b':'#1c1526','#':'#e8834a'};
+function drawOcto(x,y,heartEyes,hat,scale){
+  scale=scale||1;
+  if(hat)for(let r=0;r<3;r++){const row=HAT[r];
+    for(let c=0;c<row.length;c++){const col=HAT_COL[row[c]];
+      if(col){p.fillStyle=col;p.fillRect(x+c*scale,y+(r-3)*scale,scale,scale);}}}
+  for(let r=0;r<12;r++){const row=OCTO[r];
+    for(let c=0;c<row.length;c++){let ch=row[c];
+      if(heartEyes&&ch==='e')ch='h';
+      const col=OCTO_COL[ch];
+      if(col){p.fillStyle=col;p.fillRect(x+c*scale,y+r*scale,scale,scale);}}}
+}
+function drawHeart(x,y,col){
+  p.fillStyle=col;
+  p.fillRect(x,y,1,1);p.fillRect(x+2,y,1,1);
+  p.fillRect(x,y+1,3,1);p.fillRect(x+1,y+2,1,1);
+}
+function drawNoteBlock(x,y,s){
+  s=s||7;
+  p.fillStyle='#f2c94c';p.fillRect(x,y,s,s);
+  p.fillStyle='#f7de82';p.fillRect(x,y,s,1);p.fillRect(x,y,1,s);
+  p.fillStyle='#c99a2e';p.fillRect(x,y+s-1,s,1);p.fillRect(x+s-1,y,1,s);
+  p.fillStyle='#3a2a1a';
+  p.fillRect(x+4,y+1,1,3);p.fillRect(x+3,y+4,2,1);p.fillRect(x+2,y+4,1,1);p.fillRect(x+4,y+3,2,1);
+}
+function drawCloud(x,y,sc){
+  p.fillStyle='rgba(239,230,245,0.92)';
+  p.fillRect(x,y,14*sc,4*sc);
+  p.fillRect(x+3*sc,y-3*sc,8*sc,3*sc);
+  p.fillRect(x-4*sc,y+4*sc,18*sc,3*sc);
+  p.fillRect(x+8*sc,y+4*sc,10*sc,2*sc);
+}
+function drawSun(x,y,r,t,pulse){
+  const rr=r*(1+pulse*0.18);
+  p.fillStyle='#ffd54a';
+  p.beginPath();p.arc(x,y,rr,0,6.283);p.fill();
+  p.fillStyle='#ffe89a';
+  p.beginPath();p.arc(x-rr*0.25,y-rr*0.25,rr*0.55,0,6.283);p.fill();
+  p.fillStyle='#ffca3a';
+  for(let i=0;i<8;i++){
+    const a=i*Math.PI/4+Math.sin(t*1.2)*0.05;
+    const x1=x+Math.cos(a)*(rr+1.5),y1=y+Math.sin(a)*(rr+1.5);
+    const x2=x+Math.cos(a)*(rr+4.5+pulse*2),y2=y+Math.sin(a)*(rr+4.5+pulse*2);
+    p.fillRect(Math.min(x1,x2)-0.5,Math.min(y1,y2)-0.5,Math.abs(x2-x1)+1,Math.abs(y2-y1)+1);
+  }
+  /* 十字星光 */
+  const sp=Math.floor(t*2)%2;
+  p.fillStyle='rgba(255,240,180,0.9)';
+  p.fillRect(x-rr-8,y,2,1);p.fillRect(x+rr+6,y,2,1);
+  if(sp===0){p.fillRect(x+rr+11,y-5,1,3);p.fillRect(x+rr+10,y-4,3,1);}
+}
+const MOUNT_BACK=[[0,150],[20,132],[38,150],[70,138],[95,150],[130,128],[160,150],[200,136],[235,150],[265,130],[300,148],[320,150]];
+const MOUNT_MID=[[0,165],[30,144],[60,165],[100,150],[140,165],[185,146],[220,165],[260,152],[300,165],[320,165]];
+function drawMountains(pts,baseY,col){
+  p.fillStyle=col;p.beginPath();
+  p.moveTo(0,baseY);
+  pts.forEach(pt=>p.lineTo(pt[0],pt[1]));
+  p.lineTo(LW,baseY);p.closePath();p.fill();
+}
+
+/* ---------------- 场景元素状态 ---------------- */
+const confetti=[];
+const CONF_COLS=['#ffffff','#ffb3c8','#ffe08a','#a8e6cf','#d8b4fe','#ff9c6a'];
+function burstConf(n,cx0,cy0,spread){
+  for(let i=0;i<n;i++){
+    if(confetti.length>420)break;
+    confetti.push({
+      x:cx0+(Math.random()-0.5)*(spread||LW),
+      y:cy0+(Math.random()-0.5)*30,
+      vx:(Math.random()-0.5)*24,
+      vy:-10-Math.random()*22,
+      ph:Math.random()*6.28,
+      col:CONF_COLS[(Math.random()*CONF_COLS.length)|0],
+      s:Math.random()<0.5?1:2,
+      life:1,dec:0.18+Math.random()*0.22
+    });
+  }
+}
+let armySpawned=0;        // 禁卫军已入场数
+const ARMY_N=12;
+let flashA=0,bassE=0;
+
+/* ---------------- 时间线 ---------------- */
+const T_TYPE=1.2, TYPE_CPS=7, TYPE_TXT='睡不着，陪我看日落';
+const BASH_T=3.6, PLAY_T=3.9, TASK_T=5.6;
+const SC1_T=7.5, SC2_T=22.5, WORLD_T=30, DIALOG_T=45, OUTRO_T=56.25;
+
+/* ---------------- 歌词艺术字渲染 ---------------- */
+/* 样式：dark=深块橙字 / yellow=黄底黑字 / pink=粉底黑字 / white=白字 / fade=灰白 */
+const STYLE={
+  dark:{bg:'#241d33',fg:'#f0924f',box:true},
+  yellow:{bg:'#f2c94c',fg:'#3a2a1a',box:true},
+  pink:{bg:'#ff8fb2',fg:'#3a1a2a',box:true},
+  white:{bg:null,fg:'#f5f0e8',box:false},
+  fade:{bg:null,fg:'rgba(245,240,232,0.35)',box:false}
+};
+function drawLyricRow(items,cy,size,alpha){
+  p.font='700 '+size+'px '+KAI;
+  let total=0;
+  items.forEach(it=>{const st=STYLE[it.s];total+=(st.box?size+6:size+3);});
+  total-=3;
+  let x=(LW-total)/2;
+  items.forEach(it=>{
+    const st=STYLE[it.s],w=st.box?size+6:size+3;
+    p.save();p.globalAlpha=alpha;
+    if(st.box){
+      p.fillStyle=st.bg;rrect(p,x,cy-size*0.72,w-3,size*1.28,3);p.fill();
+    }
+    p.fillStyle=st.fg;p.textAlign='center';p.textBaseline='middle';
+    p.fillText(it.ch,x+w/2-1,cy+1);
+    p.restore();
+    x+=w;
+  });
+}
+const ROW_A=[
+  {ch:'我',s:'dark'},{ch:'要',s:'dark'},{ch:'送',s:'white'},{ch:'你',s:'yellow'},
+  {ch:'日',s:'yellow'},{ch:'不',s:'yellow'},{ch:'落',s:'yellow'}
+];
+const ROW_B=[
+  {ch:'派',s:'dark'},{ch:'出',s:'dark'},{ch:'一',s:'white'},{ch:'队',s:'white'},
+  {ch:'像',s:'yellow'},{ch:'素',s:'yellow'},{ch:'禁',s:'pink'},{ch:'卫',s:'pink'},{ch:'军',s:'pink'}
+];
+const ROW_C=[
+  {ch:'心',s:'dark'},{ch:'口',s:'dark'},{ch:'有',s:'white'},{ch:'颗',s:'white'},
+  {ch:'不',s:'yellow'},{ch:'落',s:'yellow'},{ch:'的',s:'white'},{ch:'太',s:'dark'},{ch:'阳',s:'dark'}
+];
+const ROW_TOP=[
+  {ch:'这',s:'white'},{ch:'是',s:'white'},{ch:'来',s:'white'},{ch:'自',s:'white'},
+  {ch:'星',s:'yellow'},{ch:'期',s:'yellow'},{ch:'五',s:'yellow'},
+  {ch:'的',s:'white'},{ch:'投',s:'white'},{ch:'送',s:'white'}
+];
+
+/* ---------------- 终端绘制 ---------------- */
+function drawTerminal(t){
+  /* 窗口外框 */
+  p.fillStyle='#100d1a';p.fillRect(0,0,LW,LH);
+  p.strokeStyle='#2a2440';p.lineWidth=1;p.strokeRect(0.5,0.5,LW-1,LH-1);
+  /* 标题栏 */
+  p.fillStyle='#161224';p.fillRect(1,1,LW-2,8);
+  p.fillStyle='#ff5f57';p.beginPath();p.arc(6,5,1.6,0,6.283);p.fill();
+  p.fillStyle='#febc2e';p.beginPath();p.arc(11,5,1.6,0,6.283);p.fill();
+  p.fillStyle='#28c840';p.beginPath();p.arc(16,5,1.6,0,6.283);p.fill();
+  p.fillStyle='#8f84a5';p.font='5px '+MONO;p.textAlign='center';p.textBaseline='middle';
+  p.fillText('你 — friday — 120×40',LW/2,5);
+  /* Claude Code 头（星期五版） */
+  p.strokeStyle='#e8834a';p.lineWidth=1;
+  rrect(p,14,14,292,32,4);p.stroke();
+  drawOcto(24,21,false,true,1);
+  p.textAlign='left';p.textBaseline='alphabetic';
+  p.fillStyle='#f5f0e8';p.font='700 11px '+KAI;p.fillText('星期五 Code',44,30);
+  p.fillStyle='#a89fb8';p.font='6px '+MONO;p.fillText('Opus · 星期五 Max',44,38);
+  p.fillText('~/你',44,44);
+  /* 状态栏 */
+  p.fillStyle='#6a6080';p.font='5px '+MONO;
+  p.fillText('▸▸ 站岗模式 on (shift+tab to cycle)',16,175);
+}
+
+/* 打字阶段输出 */
+function drawBoot(t){
+  const typed=clamp(Math.floor((t-T_TYPE)*TYPE_CPS),0,TYPE_TXT.length);
+  p.font='7px '+KAI;p.textAlign='left';p.textBaseline='alphabetic';
+  p.fillStyle='#e8834a';p.fillText('❯',20,64);
+  p.fillStyle='#e8e2f0';p.fillText(TYPE_TXT.slice(0,typed),32,64);
+  if((t*2)%1<0.5&&typed<TYPE_TXT.length+4){p.fillRect(32+typed*7.2+2,57,4,8);}
+  if(t>BASH_T){
+    p.font='5.5px '+MONO;
+    p.fillStyle='#4ade80';p.fillText('●',20,76);
+    p.fillStyle='#cfc4de';p.fillText('Bash(afplay ~/Music/日不落·致敬.m4a)',30,76);
+    if(t>PLAY_T){
+      p.fillStyle='#8f84a5';
+      p.fillText('▶ 正在播放 · '+mmss(t-PLAY_T),32,84);
+    }
+  }
+  if(t>TASK_T){
+    p.fillStyle='#e8834a';p.fillText('●',20,94);
+    p.fillStyle='#cfc4de';p.font='6px '+KAI;
+    p.fillText('Task(召集像素禁卫军 ×12)',30,94);
+    p.fillStyle='#8f84a5';p.font='5px '+MONO;
+    p.fillText('12 个子代理 · 守护爱情 (进行中)',32,102);
+  }
+}
+
+/* 禁卫军（像素章鱼队列） */
+function drawArmy(t,groundY,inTerminal){
+  const a=inTerminal?smooth((t-SC2_T)/0.5):1;
+  if(a<=0)return;
+  /* 逐拍入场：pre 段 16 拍内 12 只依次进入 */
+  const beatIdx=Math.floor(t/BEAT);
+  const target=clamp(Math.floor((beatIdx-24)),0,ARMY_N);  // bar 12 = beat 24
+  armySpawned=Math.max(armySpawned,inTerminal?target:ARMY_N);
+  const chorusPhase=(t>=30);
+  for(let i=0;i<armySpawned;i++){
+    const x=34+i*22;
+    const bounce=chorusPhase?Math.abs(Math.sin(t*BEAT*8+i*0.6))*3*(0.4+bassE):0;
+    const dropIn=clamp(1-((beatIdx-24-i)/2),0,1);
+    const y=groundY-13-(1-dropIn)*10-bounce;
+    p.save();p.globalAlpha=a*dropIn;
+    drawOcto(x,y,false,true,1);
+    p.restore();
+  }
+  /* 心上浮 */
+  if(chorusPhase||t>DIALOG_T-3){
+    for(let i=0;i<7;i++){
+      const rise=((t*7+i*17)%46);
+      const hx=40+i*36+Math.sin(t+i)*4;
+      const hy=groundY-14-rise;
+      p.globalAlpha=clamp(1-rise/40,0,1)*0.9;
+      drawHeart(hx,hy,'#ff7ba9');
+    }
+    p.globalAlpha=1;
+  }
+}
+
+/* 终端内的歌词场景 */
+function drawTermScenes(t){
+  /* 场景1：我要送你日不落（终端内） */
+  const a1=smooth((t-SC1_T)/0.7)*(1-smooth((t-SC2_T)/0.8));
+  if(a1>0){
+    /* 心形眼章鱼浮在上方 */
+    const bob=Math.sin(t*2)*2;
+    p.save();p.globalAlpha=a1;
+    drawOcto(148,52+bob,true,true,1);
+    p.restore();
+    drawLyricRow(ROW_A,96,20,a1);
+    p.save();p.globalAlpha=a1*0.65;
+    p.font='6px '+KAI;p.fillStyle='#cfc4de';p.textAlign='center';
+    p.fillText('—— 来自星期五 · 第 1 封信',LW/2,116);
+    p.restore();
+    /* 右侧三个音符块 */
+    p.save();p.globalAlpha=a1;
+    for(let i=0;i<3;i++){
+      drawNoteBlock(236+i*24,72-Math.sin(t*2+i)*2-i*8,7);
+    }
+    p.restore();
+  }
+  /* 场景2：派出一队像素禁卫军（终端内） */
+  const a2=smooth((t-SC2_T)/0.6)*(1-smooth((t-WORLD_T)/1.0));
+  if(a2>0){
+    drawLyricRow(ROW_B,84,17,a2);
+    p.save();p.globalAlpha=a2*0.7;
+    p.font='5.5px '+MONO;p.fillStyle='#8f84a5';p.textAlign='center';
+    p.fillText('12 agents · standing by · beat-synced',LW/2,100);
+    p.restore();
+  }
+}
+
+/* ---------------- 世界场景（像素日落） ---------------- */
+const clouds=[[30,26,1],[150,14,0.8],[250,34,1.1],[90,52,0.7],[290,16,0.9]];
+function drawWorld(t){
+  /* 天空 */
+  const gr=p.createLinearGradient(0,0,0,LH);
+  gr.addColorStop(0,'#3a2a5e');gr.addColorStop(0.45,'#8a4a72');
+  gr.addColorStop(0.72,'#e8765a');gr.addColorStop(0.86,'#ff9a5e');
+  gr.addColorStop(1,'#c2544a');
+  p.fillStyle=gr;p.fillRect(0,0,LW,LH);
+  /* 云 */
+  clouds.forEach((c,i)=>{
+    const cx0=((c[0]+t*(2+i*0.7))%(LW+60))-30;
+    drawCloud(cx0,c[1],c[2]);
+  });
+  /* 太阳（右上，FFT 脉动） */
+  drawSun(272,42,13,t,bassE);
+  /* 山 */
+  drawMountains(MOUNT_BACK,150,'#241a3e');
+  drawMountains(MOUNT_MID,165,'#1d1534');
+  /* 山顶章鱼 */
+  const bob=Math.sin(t*2.2)*1.5;
+  drawOcto(122,113+bob,true,true,1);
+  /* 音符块（上升弧线） */
+  for(let i=0;i<7;i++){
+    drawNoteBlock(148+i*22,94-i*5+Math.sin(t*2.2+i)*1.5,7);
+  }
+  /* 地面 + 金线 */
+  p.fillStyle='#171126';p.fillRect(0,165,LW,LH-165);
+  p.fillStyle='rgba(216,162,74,0.85)';p.fillRect(0,164,LW,1);
+  /* 禁卫军沿底线站岗 */
+  drawArmy(t,164,false);
+}
+
+/* ---------------- 对话框 ---------------- */
+function drawDialog(t){
+  const a=smooth((t-DIALOG_T)/0.6);
+  if(a<=0)return;
+  p.save();p.globalAlpha=a;
+  const x=56,y=52,w=208,h=88;
+  p.fillStyle='rgba(16,13,26,0.92)';rrect(p,x,y,w,h,4);p.fill();
+  p.strokeStyle='#3a3048';p.lineWidth=1;rrect(p,x,y,w,h,4);p.stroke();
+  p.textAlign='left';p.textBaseline='alphabetic';
+  p.fillStyle='#f5f0e8';p.font='700 7px '+KAI;p.fillText('送出',x+10,y+14);
+  p.fillStyle='#cfc4de';p.font='6px '+MONO;
+  p.fillText('send --to 你 "不落的光"',x+10,y+26);
+  p.fillStyle='#8f84a5';p.fillText('每天 24 小时，不落',x+10,y+35);
+  p.fillStyle='#f5f0e8';p.font='700 6.5px '+KAI;p.fillText('要收下吗？',x+10,y+48);
+  p.font='6px '+KAI;
+  p.fillStyle='#a89fb8';p.fillText('1. 要',x+14,y+60);
+  /* 高亮选项（带脉动） */
+  const hl=0.75+0.2*Math.sin(t*4);
+  p.fillStyle='rgba(120,64,32,'+hl.toFixed(3)+')';
+  rrect(p,x+8,y+63,w-16,9,2);p.fill();
+  p.fillStyle='#ffd9a0';p.fillText('❯ 2. 要，以后都不用再问',x+14,y+70);
+  p.fillStyle='#a89fb8';p.fillText('3. 不要，换种说法 (esc)',x+14,y+81);
+  /* “你”气泡 */
+  p.fillStyle='#f5f0e8';rrect(p,x+w-24,y+h+4,16,11,2);p.fill();
+  p.fillStyle='#241d33';p.font='7px '+KAI;p.textAlign='center';
+  p.fillText('你',x+w-16,y+h+12);
+  p.restore();
+}
+
+/* ---------------- 主渲染 ---------------- */
+let lastTs=0;
+function render(ts){
+  const dt=Math.min(0.05,(ts-lastTs)/1000||0.016);lastTs=ts;
+  const t=clamp(songT(),0,DUR);
+  /* FFT */
+  if(analyser&&playing){
+    analyser.getByteFrequencyData(freqData);
+    let b=0;for(let i=1;i<=8;i++)b+=freqData[i];bassE=b/(8*255);
+  } else bassE*=0.9;
+  /* drop 白闪 + 纸屑爆发 */
+  const drop16=16*BAR,drop24=24*BAR;
+  if(Math.abs(t-drop16)<0.03&&flashA<0.3){flashA=0.6;burstConf(220,LW/2,60,LW);}
+  if(Math.abs(t-drop24)<0.03&&flashA<0.3){flashA=0.45;burstConf(140,200,70,200);}
+  /* 副歌随低频撒纸屑 */
+  if(playing&&t>drop16&&bassE>0.62&&Math.random()<0.35)burstConf(3,Math.random()*LW,20,60);
+  flashA*=Math.exp(-dt*6);
+
+  const worldEnv=smooth((t-WORLD_T)/1.2);
+  const termEnv=1-worldEnv;
+
+  p.clearRect(0,0,LW,LH);
+  /* 世界层 */
+  if(worldEnv>0.01){
+    p.save();p.globalAlpha=worldEnv;
+    drawWorld(t);
+    /* 场景3 歌词：心口有颗不落的太阳 */
+    const a3=smooth((t-(WORLD_T+0.6))/0.7)*(1-smooth((t-DIALOG_T)/0.5));
+    if(a3>0)drawLyricRow(ROW_C,66,17,a3);
+    /* 对话场景顶部小字 */
+    const aTop=smooth((t-DIALOG_T)/0.5);
+    if(aTop>0)drawLyricRow(ROW_TOP,26,11,aTop);
+    drawDialog(t);
+    p.restore();
+  }
+  /* 终端层 */
+  if(termEnv>0.01){
+    p.save();p.globalAlpha=termEnv;
+    drawTerminal(t);
+    const bootA=1-smooth((t-SC1_T)/0.8);
+    if(bootA>0.01){p.save();p.globalAlpha=bootA;drawBoot(t);p.restore();}
+    drawTermScenes(t);
+    /* 终端内禁卫军（站在暗色天际线上） */
+    if(t>SC2_T-0.3){
+      p.fillStyle='#1a1430';p.fillRect(14,148,292,30);
+      drawArmy(t,160,true);
+    }
+    p.restore();
+  }
+  /* 尾奏：送达卡片 */
+  const aOut=smooth((t-OUTRO_T)/0.8);
+  if(aOut>0){
+    p.fillStyle='rgba(10,8,18,'+(aOut*0.82).toFixed(3)+')';p.fillRect(0,0,LW,LH);
+    p.save();p.globalAlpha=aOut;
+    p.textAlign='center';p.textBaseline='middle';
+    p.fillStyle='#ffd98c';p.font='700 15px '+KAI;
+    p.fillText('✓ 已送达 → ~/你的心',LW/2,80);
+    p.fillStyle='#8f84a5';p.font='7px '+KAI;
+    p.fillText('—— 星期五 · 致你',LW/2,98);
+    p.font='5px '+MONO;
+    p.fillText('PIXEL TERMINAL TRIBUTE · 320×180→×4 · WEB AUDIO 128BPM',LW/2,116);
+    p.restore();
+  }
+  /* 纸屑（跨场景顶层） */
+  for(let i=confetti.length-1;i>=0;i--){
+    const c=confetti[i];
+    c.vy+=60*dt;c.x+=c.vx*dt+Math.sin(t*5+c.ph)*14*dt;c.y+=c.vy*dt;
+    c.life-=c.dec*dt;
+    if(c.life<=0||c.y>LH+4){confetti.splice(i,1);continue;}
+    p.save();p.globalAlpha=clamp(c.life,0,1);
+    p.fillStyle=c.col;
+    p.fillRect(c.x,c.y,c.s,c.s);
+    p.restore();
+  }
+  /* drop 白闪 */
+  if(flashA>0.01){p.fillStyle='rgba(255,244,224,'+flashA.toFixed(3)+')';p.fillRect(0,0,LW,LH);}
+  /* 结尾全黑淡入 */
+  const endFade=smooth((t-59)/1);
+  if(endFade>0){p.fillStyle='rgba(0,0,0,'+endFade.toFixed(3)+')';p.fillRect(0,0,LW,LH);}
+
+  /* 上屏：×4 像素放大 */
+  cx.clearRect(0,0,1280,720);
+  cx.imageSmoothingEnabled=false;
+  cx.drawImage(LR,0,0,LW,LH,0,0,1280,720);
+  /* 轻暗角 */
+  const vg=cx.createRadialGradient(640,360,300,640,360,700);
+  vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(0,0,0,0.30)');
+  cx.fillStyle=vg;cx.fillRect(0,0,1280,720);
+  /* 暂停遮罩 */
+  if(started&&!playing&&!ended){
+    cx.fillStyle='rgba(10,8,18,0.55)';cx.fillRect(0,0,1280,720);
+    cx.fillStyle='#ffd98c';cx.font='700 44px '+KAI;
+    cx.textAlign='center';cx.textBaseline='middle';
+    cx.fillText('暂 停',640,340);
+  }
+
+  if(started&&!ended&&songT()>DUR+0.5){ended=true;playing=false;updateUI();}
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ---------------- UI ---------------- */
+function updateUI(){
+  const btn=document.getElementById('playBtn'),hint=document.getElementById('hint');
+  if(ended){
+    overlay.style.display='flex';btn.innerHTML='&#8635;';
+    hint.innerHTML='播放结束<br>点击重新播放';
+  }else if(!started){
+    overlay.style.display='flex';btn.innerHTML='&#9654;';
+    hint.innerHTML='日不落 · 像素终端MV<small>PIXEL TERMINAL TRIBUTE · 320×180 → ×4 · 128 BPM<br>点击播放 · 空格暂停 · R 重播</small>';
+  }else{
+    overlay.style.display='none';
+  }
+}
+overlay.addEventListener('click',togglePlay);
+cv.addEventListener('click',togglePlay);
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){e.preventDefault();togglePlay();}
+  else if(e.key==='r'||e.key==='R'){restart();}
+});
+updateUI();
+</script>
+</body>
+</html>
